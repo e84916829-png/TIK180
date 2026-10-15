@@ -131,11 +131,78 @@ def test_public(browser, base, width):
           '12 בנובמבר 2026' in page.inner_text('[data-event="date"]') and '20:00' in page.inner_text('[data-event="time"]')
           and page.inner_text('.ticket [data-event="price"]') == '89' and page.inner_text('#event-name') == 'ערב בדיקה',
           [page.inner_text('[data-event="date"]'), page.inner_text('[data-event="time"]')])
+    check('countdown shown when the event has a future date',
+          page.is_visible('#countdown') and re.match(r'^\d{2}$', page.inner_text('[data-cd="d"]')) is not None)
     check('no zoom link anywhere in public DOM', 'zoom.us' not in page.content())
     check('no horizontal scroll (after interactions)', no_hscroll(page))
     if SHOTS:
         page.screenshot(path=os.path.join(SHOTS, 'index-%d.png' % width), full_page=False)
     check('no console errors', not errors, errors)
+    ctx.close()
+
+
+def test_public_v2(browser, base, width):
+    """v2 interactive layer: countdown hidden without a date, ARIA carousels, keyboard tablist, pin/no-pin."""
+    print('\nindex.html v2 interactions @ %dpx' % width)
+    ctx, page, errors = new_page(browser, base, width)
+    page.goto(base + '/index.html', wait_until='load')
+    page.wait_for_function('window.TIK_EVENT && window.TIK_EVENT.id', timeout=5000)
+    check('countdown hidden while dateISO is null', not page.is_visible('#countdown'))
+    # formats tablist (RTL: ArrowLeft = next)
+    page.focus('#tab-frontal')
+    page.keyboard.press('ArrowLeft')
+    check('tablist: arrow key moves selection + focus',
+          page.get_attribute('#tab-zoom', 'aria-selected') == 'true' and page.evaluate('document.activeElement.id') == 'tab-zoom'
+          and page.is_visible('#panel-zoom') and not page.is_visible('#panel-frontal'))
+    page.keyboard.press('Home')
+    check('tablist: Home returns to first tab', page.get_attribute('#tab-frontal', 'aria-selected') == 'true')
+    # testimonials carousel
+    slides = page.evaluate('''[...document.querySelectorAll('.tcar .tslide')].map(s => [s.getAttribute('role'), s.getAttribute('aria-roledescription'), s.getAttribute('aria-label')])''')
+    check('testimonials: carousel + slide ARIA ("1 מתוך 3")',
+          page.get_attribute('.tcar', 'aria-roledescription') == 'carousel' and slides[0] == ['group', 'slide', '1 מתוך 3'] and len(slides) == 3, slides)
+    page.locator('.tcar [data-tcar-dots] .dot').nth(2).click()
+    page.wait_for_timeout(900)
+    check('testimonials: dot jumps to slide 3', page.get_attribute('.tcar [data-tcar-dots] .dot >> nth=2', 'aria-current') == 'true')
+    page.click('[data-tcar="toggle"]')
+    check('testimonials: pause button stops autoplay', 'הפעלת' in page.inner_text('[data-tcar="toggle"]') and page.get_attribute('#tcar-slides', 'aria-live') == 'polite')
+    # coverflow
+    page.click('[data-cf="next"]')
+    check('clips coverflow: next button advances + announces', page.inner_text('.cf__status').startswith('3 מתוך 3'), page.inner_text('.cf__status'))
+    pinned = page.evaluate('document.documentElement.classList.contains("story-pinned")')
+    if width >= 1024:
+        check('desktop: story is pinned horizontally', pinned)
+        page.evaluate('window.scrollTo(0, document.getElementById("story").offsetTop + document.getElementById("story").offsetHeight - innerHeight - 10)')
+        page.wait_for_timeout(300)
+        check('desktop: pinned story reaches the last chapter', page.get_attribute('.story__rail [data-goto="7"]', 'aria-current') == 'step')
+    else:
+        check('mobile: story is a swipe carousel with dots', not pinned and page.locator('.story__dots .dot').count() == 8)
+    check('no horizontal scroll (v2)', no_hscroll(page), page.evaluate('[document.documentElement.scrollWidth, innerWidth]'))
+    check('no console errors (v2)', not errors, errors)
+    ctx.close()
+
+    # reduced motion: everything static
+    ctx = browser.new_context(viewport={'width': width, 'height': 900}, reduced_motion='reduce', locale='he-IL')
+    ctx.route('**/*', lambda r: r.continue_() if r.request.url.startswith(base) else r.fulfill(status=204, body=''))
+    page = ctx.new_page()
+    page.goto(base + '/index.html', wait_until='load')
+    check('reduced motion: no pin, no preloader, no cursor, no autoplay',
+          page.evaluate('''!document.documentElement.classList.contains('story-pinned') && !document.documentElement.classList.contains('has-preloader')
+             && !document.querySelector('.cursor') && !document.querySelector('.tcar').classList.contains('is-playing')'''))
+    check('reduced motion: kinetic question rendered as plain text', page.locator('.kw').count() == 0)
+    ctx.close()
+
+    # JS disabled: nothing hidden
+    ctx = browser.new_context(viewport={'width': width, 'height': 900}, java_script_enabled=False, locale='he-IL')
+    ctx.route('**/*', lambda r: r.continue_() if r.request.url.startswith(base) else r.fulfill(status=204, body=''))
+    page = ctx.new_page()
+    page.goto(base + '/index.html', wait_until='load')
+    hidden = page.evaluate('''[...document.querySelectorAll('main h1, main h2, main h3, main p, main li, main blockquote, footer blockquote')]
+        .filter(e => !e.closest('[hidden],[aria-hidden=true],.sr-only') && e.offsetParent !== null)
+        .filter(e => { let n = e; while (n && n !== document.body) { if (parseFloat(getComputedStyle(n).opacity) < 0.99) return true; n = n.parentElement; } return false; })
+        .map(e => e.textContent.trim().slice(0, 30))''')
+    check('no-JS: no content hidden at opacity 0', not hidden, hidden[:5])
+    check('no-JS: both lecture formats visible', page.is_visible('#panel-frontal') and page.is_visible('#panel-zoom'))
+    check('no-JS: no horizontal scroll', no_hscroll(page))
     ctx.close()
 
 
@@ -379,6 +446,7 @@ def main():
         browser = p.chromium.launch()
         for w in WIDTHS:
             test_public(browser, base, w)
+            test_public_v2(browser, base, w)
             test_admin(browser, base, w)
         test_live(browser, base)
         browser.close()
